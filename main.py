@@ -1,12 +1,16 @@
 import os
+import asyncio
+import uuid
 from dotenv import load_dotenv
 from abc import ABC, abstractmethod
 from typing import List, Optional, Callable, Any, Dict
 from datetime import datetime, timedelta
 
 import boto3
-from google.adk.agents import Agent
+from google.adk.agents import LlmAgent
 from google.adk.models.google_llm import Gemini
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
 from google.adk.tools import google_search
 from google.genai import types
 from prometheus_api_client import PrometheusConnect
@@ -24,7 +28,6 @@ retry_config = types.HttpRetryOptions(
     http_status_codes=[429, 500, 503, 504]
 )
 
-
 class BaseAgent(ABC):
 
     def __init__(
@@ -39,12 +42,24 @@ class BaseAgent(ABC):
         self.tools = tools or []
         self.instruction = instruction
         self.agent = None
+        self.session_id = str(uuid.uuid4())  # Generate unique session ID
+        self.user_id = "default_user"
         self._initialize_agent()
+
+        self.session_service = InMemorySessionService()
+        # Don't create session here - do it in chat() method
+        
+        self.runner = Runner(
+            agent=self.agent,
+            app_name="agents",
+            session_service=self.session_service
+        )
+        self.session_initialized = False  # Track if session is created
 
     def _initialize_agent(self):
         """Initialize the ADK agent properly."""
 
-        self.agent = Agent(
+        self.agent = LlmAgent(
             name=self.name,
             model=Gemini(
                 model=self.model_name,
@@ -66,7 +81,7 @@ class BaseAgent(ABC):
         """Override to provide agent description"""
         pass
 
-    def get_agent(self) -> Agent:
+    def get_agent(self) -> LlmAgent:
         """Return the ADK Agent instance."""
         return self.agent
 
@@ -74,6 +89,30 @@ class BaseAgent(ABC):
         """Add a tool and refresh the agent config."""
         self.tools.append(tool)
         self._initialize_agent()
+
+    async def chat(self, user_query: str):
+        """Handle chat and return complete response"""
+        
+        # Create session on first use
+        if not self.session_initialized:
+            await self.session_service.create_session(
+                app_name="agents",
+                user_id=self.user_id,
+                session_id=self.session_id
+            )
+            self.session_initialized = True
+        
+        user_message = types.Content(role='user', parts=[types.Part(text=user_query)])
+        
+        async for event in self.runner.run_async(
+            user_id=self.user_id, 
+            session_id=self.session_id,
+            new_message=user_message 
+        ):
+            if event.is_final_response():
+                return event.content.parts[0].text
+    
+        return "No response received."
 
 
 class CostAnalyzerAgent(BaseAgent):
@@ -318,7 +357,7 @@ class AgentOrchestrator:
         self.sizing_agent = RightsizingAgent()
         print("✅ Agents Online: CostAnalyzer, RightsizingOptimizer")
 
-    def dispatch(self, user_query: str):
+    async def dispatch(self, user_query: str):
         """
         Simple intent detection to route the query to the right specialist.
         """
@@ -330,23 +369,22 @@ class AgentOrchestrator:
 
         if any(k in query_lower for k in cost_keywords):
             print(f"\n[🔄 Router] Handoff to: {self.cost_agent.name}")
-            response = self.cost_agent.chat(user_query)
-            return f"💰 {self.cost_agent.name}: {response.text}"
+            response = await self.cost_agent.chat(user_query)
+            return f"💰 {self.cost_agent.name}: {response}"
 
         elif any(k in query_lower for k in tech_keywords):
             print(f"\n[🔄 Router] Handoff to: {self.sizing_agent.name}")
-            response = self.sizing_agent.chat(user_query)
-            return f"🛠️ {self.sizing_agent.name}: {response.text}"
+            response = await self.sizing_agent.chat(user_query)
+            return f"🛠️ {self.sizing_agent.name}: {response}"
 
         else:
             # Fallback: Send to both or ask for clarification? 
             # Let's default to Cost for general inquiries
             print(f"\n[🔄 Router] Ambiguous intent. Defaulting to CostAgent.")
-            response = self.cost_agent.chat(user_query)
-            return response.text
+            response = await self.cost_agent.chat(user_query)
+            return response
 
-if __name__ == "__main__":
-    # Check Environment
+async def main():
     if not os.getenv("GOOGLE_API_KEY"):
         print("❌ Error: GOOGLE_API_KEY is missing.")
         sys.exit(1)
@@ -362,10 +400,15 @@ if __name__ == "__main__":
             if user_input.lower() in ['quit', 'exit']:
                 break
             
-            response = system.dispatch(user_input)
+            response = await system.dispatch(user_input)
             print(response)
             
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"❌ Error: {e}")
+
+if __name__ == "__main__": 
+    asyncio.run(main())
+
+    
