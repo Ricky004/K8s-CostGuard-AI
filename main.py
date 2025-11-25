@@ -1,6 +1,7 @@
 import os
+from dotenv import load_dotenv
 from abc import ABC, abstractmethod
-from typing import List, Optional, Callable, Any
+from typing import List, Optional, Callable, Any, Dict
 from datetime import datetime, timedelta
 
 import boto3
@@ -10,6 +11,8 @@ from google.adk.tools import google_search
 from google.genai import types
 from prometheus_api_client import PrometheusConnect
 from prometheus_api_client.utils import parse_datetime
+
+load_dotenv()
 
 # Load Google API Key
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -76,8 +79,8 @@ class BaseAgent(ABC):
 class CostAnalyzerAgent(BaseAgent):
 
     def __init__(self):
-        self.ce_client = boto3.client('ce')
-        self.cw_client = boto3.client('cloudwatch')
+        self.ce_client = boto3.client("ce", region_name="us-east-1")
+        self.cw_client = boto3.client("cloudwatch", region_name="us-east-1")
 
         tools = [
             self.get_daily_spend_and_trend,
@@ -256,7 +259,7 @@ class RightsizingAgent(BaseAgent):
 
     def calculate_rightsizing(
         self, current_cpu_req: float, current_mem_req_mib: float,
-        eak_cpu_usage: float, peak_mem_usage: float
+        peak_cpu_usage: float, peak_mem_usage: float
         ) -> Dict[str, Any]:
 
         """
@@ -308,4 +311,61 @@ class RightsizingAgent(BaseAgent):
             "confidence_score": confidence
         }
 
+class AgentOrchestrator:
+    def __init__(self):
+        print("🚀 Booting Multi-Agent System...")
+        self.cost_agent = CostAnalyzerAgent()
+        self.sizing_agent = RightsizingAgent()
+        print("✅ Agents Online: CostAnalyzer, RightsizingOptimizer")
 
+    def dispatch(self, user_query: str):
+        """
+        Simple intent detection to route the query to the right specialist.
+        """
+        query_lower = user_query.lower()
+        
+        # KEYWORD ROUTING LOGIC
+        cost_keywords = ['cost', 'spend', 'bill', 'price', 'budget', 'money']
+        tech_keywords = ['pod', 'cpu', 'memory', 'ram', 'rightsiz', 'limit', 'request']
+
+        if any(k in query_lower for k in cost_keywords):
+            print(f"\n[🔄 Router] Handoff to: {self.cost_agent.name}")
+            response = self.cost_agent.chat(user_query)
+            return f"💰 {self.cost_agent.name}: {response.text}"
+
+        elif any(k in query_lower for k in tech_keywords):
+            print(f"\n[🔄 Router] Handoff to: {self.sizing_agent.name}")
+            response = self.sizing_agent.chat(user_query)
+            return f"🛠️ {self.sizing_agent.name}: {response.text}"
+
+        else:
+            # Fallback: Send to both or ask for clarification? 
+            # Let's default to Cost for general inquiries
+            print(f"\n[🔄 Router] Ambiguous intent. Defaulting to CostAgent.")
+            response = self.cost_agent.chat(user_query)
+            return response.text
+
+if __name__ == "__main__":
+    # Check Environment
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("❌ Error: GOOGLE_API_KEY is missing.")
+        sys.exit(1)
+
+    system = AgentOrchestrator()
+
+    print("\n💬 Multi-Agent CLI (Type 'quit' to exit)")
+    print("---------------------------------------------")
+    
+    while True:
+        try:
+            user_input = input("\nYou: ")
+            if user_input.lower() in ['quit', 'exit']:
+                break
+            
+            response = system.dispatch(user_input)
+            print(response)
+            
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
