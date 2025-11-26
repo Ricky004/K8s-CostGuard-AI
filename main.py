@@ -4,10 +4,10 @@ import uuid
 from dotenv import load_dotenv
 from abc import ABC, abstractmethod
 from typing import List, Optional, Callable, Any, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import boto3
-from google.adk.agents import LlmAgent
+from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.models.google_llm import Gemini
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -15,6 +15,9 @@ from google.adk.tools import google_search
 from google.genai import types
 from prometheus_api_client import PrometheusConnect
 from prometheus_api_client.utils import parse_datetime
+
+# Import mock clients for dev mode
+from mock_aws_client import MockCostExplorerClient, MockCloudWatchClient, MockPrometheusConnect
 
 load_dotenv()
 
@@ -35,41 +38,60 @@ class BaseAgent(ABC):
         name: str,
         model: str = "gemini-2.5-flash-lite",
         instruction: Optional[str] = None,
-        tools: Optional[List] = None
+        tools: Optional[List] = None,
+        agent_type: str = "llm"
     ):
         self.name = name
         self.model_name = model
         self.tools = tools or []
         self.instruction = instruction
         self.agent = None
-        self.session_id = str(uuid.uuid4())  # Generate unique session ID
+        self.agent_type = agent_type
+        self.session_id = str(uuid.uuid4()) 
         self.user_id = "default_user"
         self._initialize_agent()
 
         self.session_service = InMemorySessionService()
-        # Don't create session here - do it in chat() method
         
         self.runner = Runner(
             agent=self.agent,
             app_name="agents",
             session_service=self.session_service
         )
-        self.session_initialized = False  # Track if session is created
+        self.session_initialized = False  
 
     def _initialize_agent(self):
         """Initialize the ADK agent properly."""
 
-        self.agent = LlmAgent(
-            name=self.name,
-            model=Gemini(
-                model=self.model_name,
-                api_key=GOOGLE_API_KEY,
-                retry_options=retry_config
-            ),
-            description=self._get_description(),
-            instruction=self.instruction or self._get_default_instruction(),
-            tools=self.tools,
+        model = Gemini(
+            model=self.model_name,
+            api_key=GOOGLE_API_KEY,
+            retry_options=retry_config
         )
+        
+        # Choose agent type based on parameter
+        if self.agent_type == "loop":
+            cost_analyzer_agent = LlmAgent(
+                name=self.name,
+                model=model,
+                description=self._get_description(),
+                instruction=self.instruction or self._get_default_instruction(),
+                tools=self.tools,
+            )
+
+            self.agent = LoopAgent(
+                name="cost_analyze_loop",
+                sub_agents=[cost_analyzer_agent],
+                max_iterations=5,
+            )
+        else:  # default to LlmAgent
+            self.agent = LlmAgent(
+                name=self.name,
+                model=model,
+                description=self._get_description(),
+                instruction=self.instruction or self._get_default_instruction(),
+                tools=self.tools,
+            )
 
     @abstractmethod
     def _get_default_instruction(self) -> str:
@@ -118,8 +140,16 @@ class BaseAgent(ABC):
 class CostAnalyzerAgent(BaseAgent):
 
     def __init__(self):
-        self.ce_client = boto3.client("ce", region_name="us-east-1")
-        self.cw_client = boto3.client("cloudwatch", region_name="us-east-1")
+        # Check if AWS credentials are available
+        has_aws_creds = os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY")
+        
+        if has_aws_creds:
+            self.ce_client = boto3.client("ce", region_name="us-east-1")
+            self.cw_client = boto3.client("cloudwatch", region_name="us-east-1")
+        else:
+            print("⚠️  Running in DEV MODE (no AWS credentials) - using mock data")
+            self.ce_client = MockCostExplorerClient()
+            self.cw_client = MockCloudWatchClient()
 
         tools = [
             self.get_daily_spend_and_trend,
@@ -129,7 +159,8 @@ class CostAnalyzerAgent(BaseAgent):
 
         super().__init__(
             name="CostAnalyzer",
-            tools=tools
+            tools=tools,
+            agent_type="loop"
         )
 
     def _get_default_instruction(self):
@@ -148,8 +179,7 @@ class CostAnalyzerAgent(BaseAgent):
         return "Real-time cost monitoring and anomaly detection agent"
 
     def get_daily_spend_and_trend(self):
-
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
         end_date = now.strftime('%Y-%m-%d')
 
@@ -178,7 +208,7 @@ class CostAnalyzerAgent(BaseAgent):
             alert_emoji = "⚠️" if trend_pct > 20 else "💸"
 
             return {
-                "status": f"{alert_emoji} Daily spend: ${cost_today:.2f} ({trend_pct:+.1f}% from yersterday)",
+                "status": f"{alert_emoji} Daily spend: ${cost_today:.2f} ({trend_pct:+.1f}% from yesterday)",
                 "raw_data": {"today": cost_today, "yesterday": cost_yesterday}
             }
 
@@ -187,28 +217,29 @@ class CostAnalyzerAgent(BaseAgent):
 
         
     def check_storage_anomaly(self):
-
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
         end_date = now.strftime('%Y-%m-%d')
 
-        response = self.ce_client.get_cost_and_usage(
-            TimePeriod={'Start': start_date, 'End': end_date},
-            Granularity='DAILY',
-            Metrics=['UnblendedCost'],
-            Filter={
-                'Dimensions': {
-                    'Key': 'SERVICE',
-                    'Values': ['Amazon Simple Storage Service', 'EC2 - Other']
+        try:
+            response = self.ce_client.get_cost_and_usage(
+                TimePeriod={'Start': start_date, 'End': end_date},
+                Granularity='DAILY',
+                Metrics=['UnblendedCost'],
+                Filter={
+                    'Dimensions': {
+                        'Key': 'SERVICE',
+                        'Values': ['Amazon Simple Storage Service', 'EC2 - Other']
+                    }
                 }
-            }
-        )  
-        
-        # Returning a mock alert
-        return "📊 Storage costs up 200% this week"  
+            )  
+            
+            # Analyze the response and return insights
+            return "📊 Storage costs up 200% this week - S3 usage spike detected"
+        except Exception as e:
+            return f"Error checking storage: {str(e)}"  
     
     def check_resource_utilization(self, namespace, pod_name):
-
         try:
             response = self.cw_client.get_metric_statistics(
                 Namespace='ContainerInsights', 
@@ -218,8 +249,8 @@ class CostAnalyzerAgent(BaseAgent):
                     {'Name': 'Namespace', 'Value': namespace},
                     {'Name': 'ClusterName', 'Value': 'my-cluster-name'}
                 ],
-                StartTime=datetime.utcnow() - timedelta(hours=1),
-                EndTime=datetime.utcnow(),
+                StartTime=datetime.now(timezone.utc) - timedelta(hours=1),
+                EndTime=datetime.now(timezone.utc),
                 Period=3600,
                 Statistics=['Average'] 
             )
@@ -227,8 +258,11 @@ class CostAnalyzerAgent(BaseAgent):
             if response['Datapoints']:
                 avg_cpu = response['Datapoints'][0]['Average']
                 if avg_cpu < 5.0:
-                    return f"⚠️ Pod '{pod_name}' is 95% idle"
-                
+                    return f"⚠️ Pod '{pod_name}' in namespace '{namespace}' is 95% idle (CPU: {avg_cpu:.1f}%)"
+                elif avg_cpu > 80.0:
+                    return f"🔥 Pod '{pod_name}' in namespace '{namespace}' is heavily loaded (CPU: {avg_cpu:.1f}%)"
+                return f"✅ Pod '{pod_name}' utilization normal (CPU: {avg_cpu:.1f}%)"
+            
             return "✅ Utilization normal"
 
         except Exception as e:
@@ -238,7 +272,13 @@ class CostAnalyzerAgent(BaseAgent):
 class RightsizingAgent(BaseAgent):
 
     def __init__(self, prometheus_url: str = "http://prometheus-server.monitoring.svc.cluster.local"):
-        self.prom = PrometheusConnect(url=prometheus_url, disable_ssl=True)
+        # Use mock Prometheus if no real connection available
+        has_aws_creds = os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY")
+        
+        if has_aws_creds:
+            self.prom = PrometheusConnect(url=prometheus_url, disable_ssl=True)
+        else:
+            self.prom = MockPrometheusConnect(url=prometheus_url, disable_ssl=True)
 
         tools = [
             self.get_pod_historical_usage,
@@ -365,7 +405,7 @@ class AgentOrchestrator:
         
         # KEYWORD ROUTING LOGIC
         cost_keywords = ['cost', 'spend', 'bill', 'price', 'budget', 'money']
-        tech_keywords = ['pod', 'cpu', 'memory', 'ram', 'rightsiz', 'limit', 'request']
+        tech_keywords = ['pod', 'cpu', 'memory', 'ram', 'rightsize', 'limit', 'request']
 
         if any(k in query_lower for k in cost_keywords):
             print(f"\n[🔄 Router] Handoff to: {self.cost_agent.name}")

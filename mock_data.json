@@ -1,0 +1,44 @@
+{
+  "cost_and_usage": {
+    "daily_spend": {
+      "yesterday": 45.30,
+      "today": 58.75
+    },
+    "storage_anomaly": {
+      "message": "Storage costs up 200% this week - S3 usage spike detected",
+      "service": "Amazon S3",
+      "increase_percentage": 200
+    }
+  },
+  "cloudwatch_metrics": {
+    "pod_utilization": [
+      {
+        "pod_name": "api-server",
+        "namespace": "production",
+        "cpu_percent": 75.5
+      },
+      {
+        "pod_name": "worker",
+        "namespace": "production",
+        "cpu_percent": 3.2
+      },
+      {
+        "pod_name": "cache",
+        "namespace": "staging",
+        "cpu_percent": 45.8
+      }
+    ]
+  },
+  "prometheus_metrics": {
+    "pod_historical_usage": {
+      "api-server": {
+        "peak_cpu_cores": 0.85,
+        "peak_memory_mib": 512.5
+      },
+      "worker": {
+        "peak_cpu_cores": 0.15,
+        "peak_memory_mib": 256.0
+      }
+    }
+  }
+}
