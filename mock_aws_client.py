@@ -27,23 +27,56 @@ class MockCostExplorerClient:
     def __init__(self):
         self.loader = MockDataLoader()
     
-    def get_cost_and_usage(self, TimePeriod, Granularity, Metrics, Filter=None):
+    def get_cost_and_usage(self, TimePeriod, Granularity, Metrics, Filter=None, GroupBy=None):
         """Mock get_cost_and_usage response"""
         
-        if Filter and 'SERVICE' in str(Filter):
-            # Storage anomaly request
+        # Cost by service breakdown
+        if GroupBy and GroupBy[0].get('Key') == 'SERVICE':
             return {
                 'ResultsByTime': [
-                    {'Total': {'UnblendedCost': {'Amount': '10.50'}}},
-                    {'Total': {'UnblendedCost': {'Amount': '31.50'}}}
+                    {
+                        'Groups': [
+                            {'Keys': ['Amazon Elastic Compute Cloud - Compute'], 'Metrics': {'UnblendedCost': {'Amount': '125.50'}}},
+                            {'Keys': ['Amazon Simple Storage Service'], 'Metrics': {'UnblendedCost': {'Amount': '45.30'}}},
+                            {'Keys': ['Amazon Relational Database Service'], 'Metrics': {'UnblendedCost': {'Amount': '89.20'}}},
+                            {'Keys': ['Amazon CloudWatch'], 'Metrics': {'UnblendedCost': {'Amount': '12.75'}}},
+                            {'Keys': ['AWS Lambda'], 'Metrics': {'UnblendedCost': {'Amount': '8.40'}}},
+                        ]
+                    }
                 ]
             }
         
-        # Daily spend request
+        # Storage anomaly request (14 days of data)
+        if Filter and 'SERVICE' in str(Filter):
+            return {
+                'ResultsByTime': [
+                    {'Total': {'UnblendedCost': {'Amount': '8.50'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '9.20'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '8.80'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '9.50'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '8.90'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '9.10'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '9.30'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '15.20'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '18.50'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '19.80'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '21.30'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '22.10'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '23.50'}}},
+                    {'Total': {'UnblendedCost': {'Amount': '24.20'}}}
+                ]
+            }
+        
+        # Daily spend request (7 days)
         daily_data = self.loader.get('cost_and_usage', 'daily_spend')
         
         return {
             'ResultsByTime': [
+                {'Total': {'UnblendedCost': {'Amount': '42.10'}}},
+                {'Total': {'UnblendedCost': {'Amount': '43.50'}}},
+                {'Total': {'UnblendedCost': {'Amount': '44.20'}}},
+                {'Total': {'UnblendedCost': {'Amount': '45.80'}}},
+                {'Total': {'UnblendedCost': {'Amount': '46.50'}}},
                 {'Total': {'UnblendedCost': {'Amount': str(daily_data['yesterday'])}}},
                 {'Total': {'UnblendedCost': {'Amount': str(daily_data['today'])}}}
             ]
@@ -68,18 +101,31 @@ class MockCloudWatchClient:
         
         for pod in pods:
             if pod['pod_name'] == pod_name and pod['namespace'] == namespace:
-                return {
-                    'Datapoints': [
-                        {'Average': pod['cpu_percent']}
-                    ]
-                }
+                cpu_val = pod['cpu_percent']
+                # Return both Average and Maximum if requested
+                result = {'Datapoints': [{}]}
+                if 'Average' in Statistics:
+                    result['Datapoints'][0]['Average'] = cpu_val
+                if 'Maximum' in Statistics:
+                    result['Datapoints'][0]['Maximum'] = min(cpu_val + 15, 100)  # Max is slightly higher
+                
+                # Add memory data if it's a memory metric
+                if 'memory' in MetricName.lower():
+                    mem_val = cpu_val * 0.8  # Mock: memory usually lower than CPU
+                    result['Datapoints'][0]['Average'] = mem_val
+                    if 'Maximum' in Statistics:
+                        result['Datapoints'][0]['Maximum'] = min(mem_val + 10, 100)
+                
+                return result
         
         # Random fallback if not found
-        return {
-            'Datapoints': [
-                {'Average': random.uniform(2.0, 85.0)}
-            ]
-        }
+        cpu_val = random.uniform(2.0, 85.0)
+        result = {'Datapoints': [{}]}
+        if 'Average' in Statistics:
+            result['Datapoints'][0]['Average'] = cpu_val
+        if 'Maximum' in Statistics:
+            result['Datapoints'][0]['Maximum'] = min(cpu_val + 15, 100)
+        return result
 
 
 class MockPrometheusConnect:

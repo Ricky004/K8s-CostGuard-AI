@@ -132,7 +132,9 @@ class BaseAgent(ABC):
             new_message=user_message 
         ):
             if event.is_final_response():
-                return event.content.parts[0].text
+                if event.content and event.content.parts and len(event.content.parts) > 0:
+                    return event.content.parts[0].text
+                return "Received empty response from agent."
     
         return "No response received."
 
@@ -154,7 +156,8 @@ class CostAnalyzerAgent(BaseAgent):
         tools = [
             self.get_daily_spend_and_trend,
             self.check_storage_anomaly,
-            self.check_resource_utilization
+            self.check_resource_utilization,
+            self.get_cost_by_service
         ]
 
         super().__init__(
@@ -165,20 +168,31 @@ class CostAnalyzerAgent(BaseAgent):
 
     def _get_default_instruction(self):
         return ( 
-                "You are a real-time Cloud Cost Analyzer Agent.\n"
+                "You are a Cloud Cost Analyzer Agent specialized in AWS cost optimization.\n\n"
                 "Your responsibilities:\n"
-                "- Monitor cloud costs (hourly/daily)\n"
-                "- Detect anomalies in spend trends\n"
-                "- Track CPU/Memory/Storage utilization\n"
-                "- Predict spikes and overshoot of budget\n"
-                "- Trigger alerts when abnormal patterns appear\n"
-                "Use available tools to fetch metrics and billing data."
+                "1. Monitor daily AWS spending trends and identify cost increases >20%\n"
+                "2. Detect storage cost anomalies (S3, EBS) by comparing recent vs baseline costs\n"
+                "3. Analyze pod/container resource utilization (CPU, Memory) to identify:\n"
+                "   - Underutilized resources (<5% CPU) that can be downsized\n"
+                "   - Overutilized resources (>90% CPU/Memory) that need scaling\n"
+                "4. Provide actionable recommendations with cost impact estimates\n\n"
+                "When analyzing costs:\n"
+                "- Always call the appropriate tool to get real data\n"
+                "- Compare current metrics against baselines/thresholds\n"
+                "- Explain the business impact (e.g., 'This 30% increase costs $X extra per month')\n"
+                "- Suggest specific actions (e.g., 'Reduce pod CPU request from 2 cores to 0.5 cores')\n\n"
+                "Be concise but informative. Use emojis for visual clarity."
         )
         
     def _get_description(self):
         return "Real-time cost monitoring and anomaly detection agent"
 
     def get_daily_spend_and_trend(self):
+        """
+        Fetches the last 7 days of AWS costs and calculates the day-over-day trend.
+        Returns daily spend amount and percentage change from yesterday.
+        Alerts if increase is >20%.
+        """
         now = datetime.now(timezone.utc)
         start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
         end_date = now.strftime('%Y-%m-%d')
@@ -217,8 +231,9 @@ class CostAnalyzerAgent(BaseAgent):
 
         
     def check_storage_anomaly(self):
+        """Detect storage cost anomalies by comparing recent vs historical costs"""
         now = datetime.now(timezone.utc)
-        start_date = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+        start_date = (now - timedelta(days=14)).strftime('%Y-%m-%d')  # 2 weeks for comparison
         end_date = now.strftime('%Y-%m-%d')
 
         try:
@@ -229,44 +244,135 @@ class CostAnalyzerAgent(BaseAgent):
                 Filter={
                     'Dimensions': {
                         'Key': 'SERVICE',
-                        'Values': ['Amazon Simple Storage Service', 'EC2 - Other']
+                        'Values': ['Amazon Simple Storage Service', 'Amazon Elastic Compute Cloud - Compute']
                     }
                 }
             )  
             
-            # Analyze the response and return insights
-            return "📊 Storage costs up 200% this week - S3 usage spike detected"
+            results = response['ResultsByTime']
+            if len(results) < 7:
+                return "Insufficient data for storage anomaly detection"
+            
+            # Compare last 3 days avg vs previous week avg
+            recent_costs = [float(r['Total']['UnblendedCost']['Amount']) for r in results[-3:]]
+            previous_costs = [float(r['Total']['UnblendedCost']['Amount']) for r in results[-10:-3]]
+            
+            recent_avg = sum(recent_costs) / len(recent_costs)
+            previous_avg = sum(previous_costs) / len(previous_costs)
+            
+            if previous_avg > 0:
+                change_pct = ((recent_avg - previous_avg) / previous_avg) * 100
+            else:
+                change_pct = 100.0
+            
+            if change_pct > 50:
+                return f"🚨 Storage anomaly detected! Costs up {change_pct:.1f}% (${recent_avg:.2f}/day vs ${previous_avg:.2f}/day baseline)"
+            elif change_pct > 20:
+                return f"⚠️ Storage costs increasing: +{change_pct:.1f}% (${recent_avg:.2f}/day vs ${previous_avg:.2f}/day)"
+            else:
+                return f"✅ Storage costs normal: ${recent_avg:.2f}/day (baseline: ${previous_avg:.2f}/day)"
+                
         except Exception as e:
             return f"Error checking storage: {str(e)}"  
     
-    def check_resource_utilization(self, namespace, pod_name):
+    def check_resource_utilization(self, namespace: str, pod_name: str, cluster_name: str = None):
+        """Check CPU and Memory utilization for a specific pod in EKS/ECS"""
+        if not cluster_name:
+            cluster_name = os.getenv('EKS_CLUSTER_NAME', 'my-cluster-name')
+            
         try:
-            response = self.cw_client.get_metric_statistics(
+            # Get CPU metrics
+            cpu_response = self.cw_client.get_metric_statistics(
                 Namespace='ContainerInsights', 
                 MetricName='pod_cpu_utilization',
                 Dimensions=[
                     {'Name': 'PodName', 'Value': pod_name},
                     {'Name': 'Namespace', 'Value': namespace},
-                    {'Name': 'ClusterName', 'Value': 'my-cluster-name'}
+                    {'Name': 'ClusterName', 'Value': cluster_name}
                 ],
                 StartTime=datetime.now(timezone.utc) - timedelta(hours=1),
                 EndTime=datetime.now(timezone.utc),
                 Period=3600,
-                Statistics=['Average'] 
+                Statistics=['Average', 'Maximum'] 
+            )
+            
+            # Get Memory metrics
+            mem_response = self.cw_client.get_metric_statistics(
+                Namespace='ContainerInsights',
+                MetricName='pod_memory_utilization',
+                Dimensions=[
+                    {'Name': 'PodName', 'Value': pod_name},
+                    {'Name': 'Namespace', 'Value': namespace},
+                    {'Name': 'ClusterName', 'Value': cluster_name}
+                ],
+                StartTime=datetime.now(timezone.utc) - timedelta(hours=1),
+                EndTime=datetime.now(timezone.utc),
+                Period=3600,
+                Statistics=['Average', 'Maximum']
             )
 
-            if response['Datapoints']:
-                avg_cpu = response['Datapoints'][0]['Average']
-                if avg_cpu < 5.0:
-                    return f"⚠️ Pod '{pod_name}' in namespace '{namespace}' is 95% idle (CPU: {avg_cpu:.1f}%)"
-                elif avg_cpu > 80.0:
-                    return f"🔥 Pod '{pod_name}' in namespace '{namespace}' is heavily loaded (CPU: {avg_cpu:.1f}%)"
-                return f"✅ Pod '{pod_name}' utilization normal (CPU: {avg_cpu:.1f}%)"
+            if cpu_response['Datapoints'] and mem_response['Datapoints']:
+                avg_cpu = cpu_response['Datapoints'][0]['Average']
+                max_cpu = cpu_response['Datapoints'][0]['Maximum']
+                avg_mem = mem_response['Datapoints'][0]['Average']
+                max_mem = mem_response['Datapoints'][0]['Maximum']
+                
+                # Determine status
+                if avg_cpu < 5.0 and avg_mem < 10.0:
+                    return f"⚠️ Pod '{pod_name}' is severely underutilized - CPU: {avg_cpu:.1f}%, Memory: {avg_mem:.1f}% (Consider downsizing)"
+                elif max_cpu > 90.0 or max_mem > 90.0:
+                    return f"🚨 Pod '{pod_name}' is resource-constrained - CPU: {avg_cpu:.1f}% (max: {max_cpu:.1f}%), Memory: {avg_mem:.1f}% (max: {max_mem:.1f}%) (Consider upsizing)"
+                elif avg_cpu > 70.0 or avg_mem > 70.0:
+                    return f"⚠️ Pod '{pod_name}' running hot - CPU: {avg_cpu:.1f}%, Memory: {avg_mem:.1f}%"
+                else:
+                    return f"✅ Pod '{pod_name}' utilization healthy - CPU: {avg_cpu:.1f}%, Memory: {avg_mem:.1f}%"
             
-            return "✅ Utilization normal"
+            return f"⚠️ No metrics found for pod '{pod_name}' in namespace '{namespace}'. Check if Container Insights is enabled."
 
         except Exception as e:
             return f"Error checking metrics: {str(e)}"
+    
+    def get_cost_by_service(self, days: int = 7):
+        """
+        Get cost breakdown by AWS service for the last N days.
+        Helps identify which services are driving costs.
+        """
+        now = datetime.now(timezone.utc)
+        start_date = (now - timedelta(days=days)).strftime('%Y-%m-%d')
+        end_date = now.strftime('%Y-%m-%d')
+        
+        try:
+            response = self.ce_client.get_cost_and_usage(
+                TimePeriod={'Start': start_date, 'End': end_date},
+                Granularity='DAILY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}]
+            )
+            
+            # Aggregate costs by service
+            service_costs = {}
+            for result in response['ResultsByTime']:
+                for group in result.get('Groups', []):
+                    service = group['Keys'][0]
+                    cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                    service_costs[service] = service_costs.get(service, 0) + cost
+            
+            # Sort by cost descending
+            sorted_services = sorted(service_costs.items(), key=lambda x: x[1], reverse=True)
+            
+            # Format top 5 services
+            total_cost = sum(service_costs.values())
+            top_services = sorted_services[:5]
+            
+            result = f"💰 Total cost (last {days} days): ${total_cost:.2f}\n\nTop services:\n"
+            for service, cost in top_services:
+                pct = (cost / total_cost * 100) if total_cost > 0 else 0
+                result += f"  • {service}: ${cost:.2f} ({pct:.1f}%)\n"
+            
+            return result
+            
+        except Exception as e:
+            return f"Error fetching cost by service: {str(e)}"
 
         
 class RightsizingAgent(BaseAgent):
@@ -292,20 +398,40 @@ class RightsizingAgent(BaseAgent):
 
     def _get_default_instruction(self):
         return (
-            "You are a Kubernetes Rightsizing Expert.\n"
-            "Your Goal: Reduce waste without causing OOM (Out of Memory) errors.\n"
-            "1. Fetch historical usage for a specific pod (look back 7 days).\n"
-            "2. Compare 'Requested' resources vs 'Actual' usage (Max & Avg).\n"
-            "3. Apply a safety buffer (usually +20% over Peak usage).\n"
-            "4. Calculate potential cost savings.\n"
-            "5. Output a recommendation with a confidence score."
+            "You are a Kubernetes Rightsizing Expert specialized in optimizing pod resource requests.\n\n"
+            "Your Goal: Reduce waste without causing OOM (Out of Memory) errors or CPU throttling.\n\n"
+            "Workflow:\n"
+            "1. Use get_pod_historical_usage() to fetch 7-day peak CPU and memory usage\n"
+            "2. Ask the user for current resource requests if not provided\n"
+            "3. Use calculate_rightsizing() to compute optimal requests with 20% safety buffer\n"
+            "4. Present recommendations with:\n"
+            "   - Current vs recommended resource requests\n"
+            "   - Utilization percentages\n"
+            "   - Monthly cost savings estimate\n"
+            "   - Confidence score (Low if pod is near limits, High otherwise)\n\n"
+            "Interpretation Guidelines:\n"
+            "- Utilization <50%: Significantly overprovisioned, high savings potential\n"
+            "- Utilization 50-80%: Well-sized, minor optimization possible\n"
+            "- Utilization >90%: Risk of throttling, recommend upsizing instead\n\n"
+            "Always explain the business impact and provide kubectl commands for implementation."
         )
 
     def _get_description(self):
         return "Analyzes container usage vs requests to recommend optimized resource limits."
 
     def get_pod_historical_usage(self, pod_name: str, namespace: str, days: int = 7) -> Dict[str, float]:
-
+        """
+        Fetches historical peak CPU and memory usage for a Kubernetes pod from Prometheus.
+        Returns peak values over the specified time period (default 7 days).
+        
+        Args:
+            pod_name: Name of the pod to analyze
+            namespace: Kubernetes namespace where the pod runs
+            days: Number of days to look back (default: 7)
+        
+        Returns:
+            Dict with peak_cpu_cores and peak_memory_mib
+        """
         start_time = parse_datetime(f"{days}d")
         end_time = parse_datetime("now")
         step = "1h" # Granularity
@@ -340,9 +466,17 @@ class RightsizingAgent(BaseAgent):
         self, current_cpu_req: float, current_mem_req_mib: float,
         peak_cpu_usage: float, peak_mem_usage: float
         ) -> Dict[str, Any]:
-
         """
-        Mathematically calculates the new recommended limits with a safety buffer.
+        Calculates optimal resource requests based on historical peak usage with 20% safety buffer.
+        
+        Args:
+            current_cpu_req: Current CPU request in cores (e.g., 2.0 = 2 cores)
+            current_mem_req_mib: Current memory request in MiB (e.g., 1024 = 1 GiB)
+            peak_cpu_usage: Peak CPU usage observed in cores
+            peak_mem_usage: Peak memory usage observed in MiB
+        
+        Returns:
+            Dict with recommendation, utilization metrics, cost savings, and confidence score
         """
         # Configuration
         SAFETY_BUFFER = 0.20  # 20% headroom
@@ -399,30 +533,60 @@ class AgentOrchestrator:
 
     async def dispatch(self, user_query: str):
         """
-        Simple intent detection to route the query to the right specialist.
+        Intent detection to route queries to the appropriate specialist agent.
+        Supports single-agent and multi-agent coordination for complex queries.
         """
         query_lower = user_query.lower()
         
         # KEYWORD ROUTING LOGIC
-        cost_keywords = ['cost', 'spend', 'bill', 'price', 'budget', 'money']
-        tech_keywords = ['pod', 'cpu', 'memory', 'ram', 'rightsize', 'limit', 'request']
-
-        if any(k in query_lower for k in cost_keywords):
+        cost_keywords = ['cost', 'spend', 'bill', 'price', 'budget', 'money', 'expensive', 'savings', 'save']
+        tech_keywords = ['pod', 'cpu', 'memory', 'ram', 'rightsize', 'limit', 'request', 'container', 'resource']
+        optimization_keywords = ['optimize', 'reduce', 'improve', 'efficiency']
+        
+        has_cost_intent = any(k in query_lower for k in cost_keywords)
+        has_tech_intent = any(k in query_lower for k in tech_keywords)
+        has_optimization_intent = any(k in query_lower for k in optimization_keywords)
+        
+        # Complex query: needs both agents (e.g., "save money by rightsizing")
+        if (has_cost_intent and has_tech_intent) or (has_optimization_intent and (has_cost_intent or has_tech_intent)):
+            print(f"\n[🔃 Reouter] Complex query detected - coordinating both agents")
+            
+            # First, get technical analysis
+            print(f"  └─ Step 1: {self.sizing_agent.name} analyzing resources...")
+            tech_response = await self.sizing_agent.chat(
+                f"Analyze resource usage and provide rightsizing recommendations. Original query: {user_query}"
+            )
+            
+            # Then, get cost analysis
+            print(f"  └─ Step 2: {self.cost_agent.name} analyzing costs...")
+            cost_response = await self.cost_agent.chat(
+                f"Analyze current costs and spending trends. Original query: {user_query}"
+            )
+            
+            # Combine insights
+            return (
+                f"🤝 Multi-Agent Analysis:\n\n"
+                f"💰 Cost Perspective:\n{cost_response}\n\n"
+                f"🛠️ Technical Perspective:\n{tech_response}\n\n"
+                f"💡 Recommendation: Review the technical rightsizing suggestions above to achieve the cost savings identified."
+            )
+        
+        # Single agent routing
+        elif has_cost_intent:
             print(f"\n[🔄 Router] Handoff to: {self.cost_agent.name}")
             response = await self.cost_agent.chat(user_query)
             return f"💰 {self.cost_agent.name}: {response}"
 
-        elif any(k in query_lower for k in tech_keywords):
+        elif has_tech_intent:
             print(f"\n[🔄 Router] Handoff to: {self.sizing_agent.name}")
             response = await self.sizing_agent.chat(user_query)
             return f"🛠️ {self.sizing_agent.name}: {response}"
 
         else:
-            # Fallback: Send to both or ask for clarification? 
-            # Let's default to Cost for general inquiries
-            print(f"\n[🔄 Router] Ambiguous intent. Defaulting to CostAgent.")
+            # Fallback: Default to Cost for general inquiries
+            print(f"\n[🔄 Router] Ambiguous intent. Defaulting to {self.cost_agent.name}.")
             response = await self.cost_agent.chat(user_query)
-            return response
+            return f"💰 {self.cost_agent.name}: {response}"
 
 async def main():
     if not os.getenv("GOOGLE_API_KEY"):
