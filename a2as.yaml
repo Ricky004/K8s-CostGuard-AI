@@ -1,0 +1,271 @@
+manifest:
+  version: "0.1.3"
+  schema: https://a2as.org/cert/schema
+  subject:
+    name: tridipdam/k8s-costguard-ai
+    source: https://github.com/tridipdam/k8s-costguard-ai
+    branch: main
+    commit: "3b85f065"
+    scope: [main.py, mock_aws_client.py]
+  issued:
+    by: A2AS.org
+    at: '2026-02-11T17:06:51Z'
+    url: https://a2as.org/certified/agents/tridipdam/k8s-costguard-ai
+  signatures:
+    digest: sha256:YwV1Vf-g4Lbv0VeVQaueS5LmJ_SpFiydVCB5lsg237Y
+    key: ed25519:f0V-7xAq_VKXlzlxlpN9S5C7J0pTG3aXcZ-Flp2U5Uw
+    sig: ed25519:N9AF9zus4OMj2HlWSWR6zXqJf1fEwuGf5YmKlRbGpMz5W-6zfmTQGtJOa_xH1XKxKEEGDRRPO2G8UU_2gLOaCg
+
+agents:
+  agent.BaseAgent.agent.0:
+    type: class
+    params:
+      name: cost_analyze_loop
+      max_iterations: "5"
+      class: BaseAgent
+      sub_agents: [cost_analyzer_agent]
+      instance: agent.BaseAgent.agent
+  agent.BaseAgent.agent.1:
+    type: class
+    models: [model]
+    tools: [self.tools]
+    params:
+      name: self.name
+      description: self._get_description()
+      instruction: ''
+      class: BaseAgent
+      instance: agent.BaseAgent.agent
+  agent.CostAnalyzerAgent:
+    type: class
+    models: [gemini-2.5-flash]
+    tools: [tools]
+    params:
+      class: CostAnalyzerAgent
+      base: BaseAgent
+      name: CostAnalyzer
+      agent_type: loop
+  agent.RightsizingAgent:
+    type: class
+    models: [gemini-2.5-flash]
+    tools: [get_daily_spend_and_trend, check_storage_anomaly, check_resource_utilization, get_cost_by_service]
+    params:
+      class: RightsizingAgent
+      base: BaseAgent
+      name: RightsizingOptimizer
+  cost_analyzer_agent:
+    type: instance
+    models: [model]
+    tools: [self.tools]
+    params:
+      name: self.name
+      description: self._get_description()
+      instruction: ''
+      function: _initialize_agent
+  system.cost_agent:
+    type: instance
+    models: [gemini-2.5-flash]
+    params:
+      class: AgentOrchestrator
+  system.sizing_agent:
+    type: instance
+    models: [gemini-2.5-flash]
+    params:
+      class: AgentOrchestrator
+
+models:
+  gemini-2.5-flash:
+    type: default
+    agents: [system.cost_agent, system.sizing_agent, agent.CostAnalyzerAgent, agent.RightsizingAgent]
+  model:
+    type: literal
+    agents: [cost_analyzer_agent, agent.BaseAgent.agent.1]
+
+tools:
+  check_resource_utilization:
+    type: function
+    agents: [agent.RightsizingAgent]
+    params:
+      module: self.check_resource_utilization
+      description: Check CPU and Memory utilization for a specific pod in EKS/ECS
+  check_storage_anomaly:
+    type: function
+    agents: [agent.RightsizingAgent]
+    params:
+      module: self.check_storage_anomaly
+      description: Detect storage cost anomalies by comparing recent vs historical costs
+  get_cost_by_service:
+    type: function
+    agents: [agent.RightsizingAgent]
+    params:
+      module: self.get_cost_by_service
+      description: |-
+        Get cost breakdown by AWS service for the last N days.
+        Helps identify which services are driving costs.
+  get_daily_spend_and_trend:
+    type: function
+    agents: [agent.RightsizingAgent]
+    params:
+      module: self.get_daily_spend_and_trend
+      description: |-
+        Fetches the last 7 days of AWS costs and calculates the day-over-day trend.
+        Returns daily spend amount and percentage change from yesterday.
+        Alerts if increase is >20%.
+  self.tools:
+    type: function
+    agents: [cost_analyzer_agent, agent.BaseAgent.agent.1]
+    params:
+      dynamic: "True"
+  tools:
+    type: function
+    agents: [agent.CostAnalyzerAgent]
+    params:
+      dynamic: "True"
+
+teams:
+  agent.BaseAgent.agent:
+    type: loop
+    agents: [agent.BaseAgent.agent, cost_analyzer_agent]
+
+imports:
+  ABC: abc.ABC
+  abstractmethod: abc.abstractmethod
+  Any: typing.Any
+  asyncio: asyncio
+  boto3: boto3
+  Callable: typing.Callable
+  datetime: datetime.datetime
+  Dict: typing.Dict
+  Gemini: google.adk.models.google_llm.Gemini
+  google_search: google.adk.tools.google_search
+  InMemorySessionService: google.adk.sessions.InMemorySessionService
+  json: json
+  List: typing.List
+  LlmAgent: google.adk.agents.LlmAgent
+  load_dotenv: dotenv.load_dotenv
+  LoopAgent: google.adk.agents.LoopAgent
+  MockCloudWatchClient: mock_aws_client.MockCloudWatchClient
+  MockCostExplorerClient: mock_aws_client.MockCostExplorerClient
+  MockPrometheusConnect: mock_aws_client.MockPrometheusConnect
+  Optional: typing.Optional
+  os: os
+  parse_datetime: prometheus_api_client.utils.parse_datetime
+  PrometheusConnect: prometheus_api_client.PrometheusConnect
+  random: random
+  Runner: google.adk.runners.Runner
+  timedelta: datetime.timedelta
+  timezone: datetime.timezone
+  types: google.genai.types
+  uuid: uuid
+
+functions:
+  __init__:
+    type: sync
+    module: mock_aws_client
+    args: [self, url, disable_ssl]
+  _get_default_instruction:
+    type: sync
+    module: main
+    args: [self]
+  _get_description:
+    type: sync
+    module: main
+    args: [self]
+  _initialize_agent:
+    type: sync
+    module: main
+    args: [self]
+  add_tool:
+    type: sync
+    module: main
+    args: [self, tool]
+  calculate_rightsizing:
+    type: sync
+    module: main
+    args: [self, current_cpu_req, current_mem_req_mib, peak_cpu_usage, peak_mem_usage]
+    params:
+      returns: Dict
+  chat:
+    type: async
+    module: main
+    args: [self, user_query]
+  check_resource_utilization:
+    type: sync
+    module: main
+    args: [self, namespace, pod_name, cluster_name]
+  check_storage_anomaly:
+    type: sync
+    module: main
+    args: [self]
+  custom_query:
+    type: sync
+    module: mock_aws_client
+    args: [self, query]
+  dispatch:
+    type: async
+    module: main
+    args: [self, user_query]
+  get:
+    type: sync
+    module: mock_aws_client
+    args: [self]
+  get_agent:
+    type: sync
+    module: main
+    args: [self]
+    params:
+      returns: LlmAgent
+  get_cost_and_usage:
+    type: sync
+    module: mock_aws_client
+    args: [self, TimePeriod, Granularity, Metrics, Filter, GroupBy]
+  get_cost_by_service:
+    type: sync
+    module: main
+    args: [self, days]
+  get_daily_spend_and_trend:
+    type: sync
+    module: main
+    args: [self]
+  get_metric_statistics:
+    type: sync
+    module: mock_aws_client
+    args: [self, Namespace, MetricName, Dimensions, StartTime, EndTime, Period, Statistics]
+  get_pod_historical_usage:
+    type: sync
+    module: main
+    args: [self, pod_name, namespace, days]
+    params:
+      returns: Dict
+  main:
+    type: async
+    module: main
+
+variables:
+  AWS_ACCESS_KEY_ID:
+    type: env
+    params:
+      caller: [os.getenv]
+      path: [main]
+  AWS_SECRET_ACCESS_KEY:
+    type: env
+    params:
+      caller: [os.getenv]
+      path: [main]
+  EKS_CLUSTER_NAME:
+    type: env
+    params:
+      caller: [os.getenv]
+      path: [main]
+  GOOGLE_API_KEY:
+    type: env
+    params:
+      caller: [os.getenv]
+      path: [main]
+
+files:
+  mock_file:
+    type: variable
+    actions: [read]
+    params:
+      caller: [open, json.load]
+      alias: [f]
